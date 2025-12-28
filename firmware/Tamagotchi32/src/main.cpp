@@ -19,8 +19,10 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
-#include <U8g2lib.h>
-#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <SPI.h>
+#include <pgmspace.h>
 
 #include "tamalib.h"
 #include "hw.h"
@@ -33,33 +35,38 @@
 #include "Tone32.h"
 #endif
 
-/***** Set display orientation, U8G2_MIRROR_VERTICAL is not supported *****/
-#define U8G2_LAYOUT_NORMAL
-// #define U8G2_LAYOUT_ROTATE_180
-// #define U8G2_LAYOUT_MIRROR
+/*** Display Configuration ***/
+#define DISPLAY_WIDTH 240
+#define DISPLAY_HEIGHT 240
+
+/***** ST7789 Display Pin Definitions *****/
+#if defined(ESP32)
+#define TFT_CS    5   // Chip Select
+#define TFT_DC    19  // Data/Command
+#define TFT_RST   21  // Reset
+#define TFT_BL    22  // Backlight (optional)
+#define TFT_MOSI  23  // SPI Data (MOSI)
+#define TFT_SCLK  18  // SPI Clock (SCK)
+#endif
 /**************************************************************************/
 
-#ifdef U8G2_LAYOUT_NORMAL
-U8G2_SSD1306_128X64_NONAME_2_HW_I2C display(U8G2_R0);
-#endif
-
-#ifdef U8G2_LAYOUT_ROTATE_180
-U8G2_SSD1306_128X64_NONAME_2_HW_I2C display(U8G2_R2);
-#endif
-
-#ifdef U8G2_LAYOUT_MIRROR
-U8G2_SSD1306_128X64_NONAME_2_HW_I2C display(U8G2_MIRROR);
+// Initialize ST7789 display (240x240)
+#if defined(ESP32)
+// Use HSPI for ST7789 with custom pins
+SPIClass hspi(HSPI);
+Adafruit_ST7789 display = Adafruit_ST7789(&hspi, TFT_CS, TFT_DC, TFT_RST);
+#else
+Adafruit_ST7789 display = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 #endif
 
 #if defined(ESP32)
-#define PIN_BTN_L 18
-#define PIN_BTN_M 19
-#define PIN_BTN_R 23
+#define PIN_BTN_L 17
+#define PIN_BTN_M 25
+#define PIN_BTN_R 4
 #define PIN_BUZZER 15
 #define BUZZER_CHANNEL 0
 #define TONE_CHANNEL 15
-
-#if defined(ESP8266)
+#elif defined(ESP8266)
 #define PIN_BTN_L 12
 #define PIN_BTN_M 13
 #define PIN_BTN_R 15
@@ -265,12 +272,21 @@ static hal_t hal = {
     .handler = &hal_handler,
 };
 
+// Scaling factor: 240/32 = 7.5x
+#define SCALE_FACTOR 7.5
+#define OFFSET_X 0    // Horizontal offset (centered)
+#define OFFSET_Y 60   // Vertical offset to center 120px height in 240px screen
+
 void drawTriangle(uint8_t x, uint8_t y)
 {
-  // display.drawLine(x,y,x+6,y);
-  display.drawLine(x + 1, y + 1, x + 5, y + 1);
-  display.drawLine(x + 2, y + 2, x + 4, y + 2);
-  display.drawLine(x + 3, y + 3, x + 3, y + 3);
+  // Scale coordinates
+  uint16_t sx = (uint16_t)(x * SCALE_FACTOR) + OFFSET_X;
+  uint16_t sy = (uint16_t)(y * SCALE_FACTOR) + OFFSET_Y;
+  uint16_t scale = (uint16_t)SCALE_FACTOR;
+  
+  display.drawLine(sx + scale, sy + scale, sx + 5*scale, sy + scale);
+  display.drawLine(sx + 2*scale, sy + 2*scale, sx + 4*scale, sy + 2*scale);
+  display.drawLine(sx + 3*scale, sy + 3*scale, sx + 3*scale, sy + 3*scale);
 }
 
 void drawTamaRow(uint8_t tamaLCD_y, uint8_t ActualLCD_y, uint8_t thick)
@@ -282,7 +298,12 @@ void drawTamaRow(uint8_t tamaLCD_y, uint8_t ActualLCD_y, uint8_t thick)
     mask = mask >> (i % 8);
     if ((matrix_buffer[tamaLCD_y][i / 8] & mask) != 0)
     {
-      display.drawBox(i + i + i + 16, ActualLCD_y, 2, thick);
+      // Scale pixel position: original was 3*i + 16, now 7.5*i + offset
+      uint16_t x = (uint16_t)(i * SCALE_FACTOR) + OFFSET_X;
+      uint16_t y = (uint16_t)(ActualLCD_y * SCALE_FACTOR) + OFFSET_Y;
+      uint16_t w = (uint16_t)SCALE_FACTOR;
+      uint16_t h = (uint16_t)(thick * SCALE_FACTOR);
+      display.fillRect(x, y, w, h, ST77XX_WHITE);
     }
   }
 }
@@ -294,72 +315,83 @@ void drawTamaSelection(uint8_t y)
   {
     if (icon_buffer[i])
       drawTriangle(i * 16 + 5, y);
-    display.drawXBMP(i * 16 + 4, y + 6, 16, 9, bitmaps + i * 18);
+    // Scale bitmap position and size
+    uint16_t bx = (uint16_t)((i * 16 + 4) * SCALE_FACTOR) + OFFSET_X;
+    uint16_t by = (uint16_t)((y + 6) * SCALE_FACTOR) + OFFSET_Y;
+    // Draw bitmap at original size, then scale manually by drawing each pixel
+    // Bitmap is 16x9, stored as 18 bytes (16*9/8 = 18)
+    // Each row is 16 bits = 2 bytes, 9 rows total
+    for (uint8_t by_pixel = 0; by_pixel < 9; by_pixel++)
+    {
+      for (uint8_t bx_pixel = 0; bx_pixel < 16; bx_pixel++)
+      {
+        uint8_t byte_idx = by_pixel * 2 + (bx_pixel / 8);
+        uint8_t bit_idx = 7 - (bx_pixel % 8);
+        uint8_t byte_val = pgm_read_byte(bitmaps + i * 18 + byte_idx);
+        if (byte_val & (1 << bit_idx))
+        {
+          // Draw scaled pixel
+          uint16_t px = bx + (uint16_t)(bx_pixel * SCALE_FACTOR);
+          uint16_t py = by + (uint16_t)(by_pixel * SCALE_FACTOR);
+          uint16_t pw = (uint16_t)SCALE_FACTOR;
+          uint16_t ph = (uint16_t)SCALE_FACTOR;
+          display.fillRect(px, py, pw, ph, ST77XX_WHITE);
+        }
+      }
+    }
   }
   if (icon_buffer[7])
   {
     drawTriangle(7 * 16 + 5, y);
-    display.drawXBMP(7 * 16 + 4, y + 6, 16, 9, bitmaps + 7 * 18);
+    uint16_t bx = (uint16_t)((7 * 16 + 4) * SCALE_FACTOR) + OFFSET_X;
+    uint16_t by = (uint16_t)((y + 6) * SCALE_FACTOR) + OFFSET_Y;
+    for (uint8_t by_pixel = 0; by_pixel < 9; by_pixel++)
+    {
+      for (uint8_t bx_pixel = 0; bx_pixel < 16; bx_pixel++)
+      {
+        uint8_t byte_idx = by_pixel * 2 + (bx_pixel / 8);
+        uint8_t bit_idx = 7 - (bx_pixel % 8);
+        uint8_t byte_val = pgm_read_byte(bitmaps + 7 * 18 + byte_idx);
+        if (byte_val & (1 << bit_idx))
+        {
+          uint16_t px = bx + (uint16_t)(bx_pixel * SCALE_FACTOR);
+          uint16_t py = by + (uint16_t)(by_pixel * SCALE_FACTOR);
+          uint16_t pw = (uint16_t)SCALE_FACTOR;
+          uint16_t ph = (uint16_t)SCALE_FACTOR;
+          display.fillRect(px, py, pw, ph, ST77XX_WHITE);
+        }
+      }
+    }
   }
 }
 
 void displayTama()
 {
   uint8_t j;
-  display.firstPage();
-#ifdef U8G2_LAYOUT_ROTATE_180
-  drawTamaSelection(49);
-  display.nextPage();
-
-  for (j = 11; j < LCD_HEIGHT; j++)
-  {
-    drawTamaRow(j, j + j + j, 2);
-  }
-  display.nextPage();
-
-  for (j = 5; j <= 10; j++)
-  {
-    if (j == 5)
-    {
-      drawTamaRow(j, j + j + j + 1, 1);
-    }
-    else
-    {
-      drawTamaRow(j, j + j + j, 2);
-    }
-  }
-  display.nextPage();
-
-  for (j = 0; j <= 5; j++)
-  {
-    if (j == 5)
-    {
-      drawTamaRow(j, j + j + j, 1);
-    }
-    else
-    {
-      drawTamaRow(j, j + j + j, 2);
-    }
-  }
-  display.nextPage();
-#else
+  
+  // Clear screen with black background
+  display.fillScreen(ST77XX_BLACK);
+  
+  // Draw Tamagotchi display area (32x16 scaled to 240x120, centered)
   for (j = 0; j < LCD_HEIGHT; j++)
   {
     if (j != 5)
-      drawTamaRow(j, j + j + j, 2);
-    if (j == 5)
     {
-      drawTamaRow(j, j + j + j, 1);
-      display.nextPage();
-      drawTamaRow(j, j + j + j + 1, 1);
+      // Original: j + j + j = 3*j, scaled: 3*j * 7.5 = 22.5*j
+      drawTamaRow(j, 3 * j, 2);
     }
-    if (j == 10)
-      display.nextPage();
+    else
+    {
+      // Special handling for row 5 (split row in original)
+      drawTamaRow(j, 3 * j, 1);
+      drawTamaRow(j, 3 * j + 1, 1);
+    }
   }
-  display.nextPage();
-  drawTamaSelection(49);
-  display.nextPage();
-#endif
+  
+  // Draw icon selection area at bottom
+  // Original y position was 49, scaled: 49 * 7.5 = 367.5, but we want it at bottom
+  // Icons are at the bottom of the 16-row display, so position at y = 16 (end of display)
+  drawTamaSelection(16);
 }
 
 #ifdef ENABLE_DUMP_STATE_TO_SERIAL_WHEN_START
@@ -422,9 +454,21 @@ void setup()
 
 #if defined(ESP32)
   ledcSetup(BUZZER_CHANNEL, NOTE_C4, 8);
+  
+  // Initialize backlight pin if defined
+  #ifdef TFT_BL
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH); // Turn on backlight
+  #endif
+  
+  // Initialize SPI bus for ST7789
+  hspi.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
 #endif
 
-  display.begin();
+  // Initialize ST7789 display
+  display.init(DISPLAY_WIDTH, DISPLAY_HEIGHT);
+  display.setRotation(0);
+  display.fillScreen(ST77XX_BLACK);
 
   tamalib_register_hal(&hal);
   tamalib_set_framerate(TAMA_DISPLAY_FRAMERATE);
@@ -460,7 +504,7 @@ void upload_state()
 
 void enter_deepsleep(int _ms)
 {
-#ifndef
+#ifndef ENABLE_DEEPSLEEP
   return;
 #endif
   // save CURRENT STATE
@@ -468,7 +512,13 @@ void enter_deepsleep(int _ms)
 
 
   //DISABLE DISPLAY
-  display.clear();
+  display.fillScreen(ST77XX_BLACK);
+  
+#if defined(ESP32)
+  #ifdef TFT_BL
+  digitalWrite(TFT_BL, LOW); // Turn off backlight
+  #endif
+#endif
 
   // ENTER DEEPSLEEP
 #if defined(ESP32)
@@ -509,7 +559,7 @@ void loop()
 #endif
     }
   }
-  else if (digitalRead(PIN_BT_L) == BUTTON_VOLTAGE_LEVEL_PRESSED)
+  else if (digitalRead(PIN_BTN_L) == BUTTON_VOLTAGE_LEVEL_PRESSED)
   {
     if (millis() - right_long_press_started > AUTO_SAVE_MINUTES * 1000)
     {
